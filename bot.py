@@ -27,8 +27,8 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (BotCommand, BotCommandScopeChat, BotCommandScopeDefault,
-                           CallbackQuery, InlineKeyboardMarkup, KeyboardButton, Message,
-                           ReplyKeyboardMarkup)
+                           CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup,
+                           KeyboardButton, Message, ReplyKeyboardMarkup)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -65,7 +65,11 @@ WEEKDAY_NAMES = list(WEEKDAYS)
 PERIODS = {7: "каждую неделю", 14: "раз в 2 недели", 1: "каждый день", 0: "один раз"}
 DURATIONS = {2: "2 часа", 4: "4 часа", 24: "сутки", -1: "до следующего раза"}
 
-router = Router()
+router = Router()            # всё общение — в личке
+router.message.filter(F.chat.type == "private")
+group_router = Router()      # в группе бот только ведёт «живые» сообщения об очередях
+group_router.message.filter(F.chat.type.in_({"group", "supergroup"}))
+BOT_USERNAME = ""
 log = logging.getLogger("queue-bot")
 admins: set[int] = set(ENV_ADMINS)
 owners: set[int] = set(ENV_ADMINS)  # главные админы: могут назначать других
@@ -147,6 +151,20 @@ CREATE TABLE IF NOT EXISTS rules (
     first_at    TEXT NOT NULL,
     period_days INTEGER NOT NULL,
     duration_h  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE TABLE IF NOT EXISTS group_posts (
+    queue_id   INTEGER PRIMARY KEY,
+    message_id INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ui (
+    tg_id     INTEGER PRIMARY KEY,
+    screen_id INTEGER,
+    notice_id INTEGER,
+    kb_id     INTEGER
 );
 CREATE TABLE IF NOT EXISTS admins (
     tg_id INTEGER PRIMARY KEY,
@@ -243,11 +261,37 @@ def member_line(i, name, grp, lab) -> str:
     return line
 
 
-async def notify(bot: Bot, uid: int, text: str):
+# ---------- «одно окно»: старые сообщения бота удаляются ----------
+# screen — текущий экран (меню, очередь, расписание...), notice — последнее уведомление,
+# kb — сообщение с нижней клавиатурой. Новое сообщение в слоте удаляет предыдущее.
+
+async def ui_swap(bot: Bot, chat_id: int, slot: str, new_id: int):
+    row = await fetchone(f"SELECT {slot}_id FROM ui WHERE tg_id = ?", chat_id)
+    await execute(f"INSERT INTO ui (tg_id, {slot}_id) VALUES (?, ?) "
+                  f"ON CONFLICT(tg_id) DO UPDATE SET {slot}_id = excluded.{slot}_id",
+                  chat_id, new_id)
+    if row and row[0] and row[0] != new_id:
+        try:
+            await bot.delete_message(chat_id, row[0])
+        except Exception:
+            pass  # уже удалено или старше 48 часов
+
+
+async def say(m: Message, text: str, reply_markup=None, slot: str = "screen"):
+    """Отправить сообщение вместо предыдущего в том же слоте."""
+    msg = await m.bot.send_message(m.chat.id, text, reply_markup=reply_markup)
+    await ui_swap(m.bot, m.chat.id, slot, msg.message_id)
+    return msg
+
+
+async def notify(bot: Bot, uid: int, text: str, important: bool = False):
+    """Уведомление. Обычное заменяет предыдущее, важное («Твоя очередь!») остаётся."""
     try:
-        await bot.send_message(uid, text)
+        msg = await bot.send_message(uid, text)
     except (TelegramForbiddenError, TelegramBadRequest):
-        pass  # пользователь заблокировал бота или чат недоступен
+        return  # пользователь заблокировал бота или чат недоступен
+    if not important:
+        await ui_swap(bot, uid, "notice", msg.message_id)
 
 
 async def safe_edit(c: CallbackQuery, text: str, kb: InlineKeyboardMarkup):
@@ -271,9 +315,10 @@ async def remove_from_queue(bot: Bot, qid: int, uid: int) -> bool:
     rest = ids[:pos] + ids[pos + 1:]
     if pos == 0 and rest:
         await notify(bot, rest[0], f"🔔 <b>Твоя очередь!</b> Подходи сдавать: {title}\n"
-                                   "Когда сдашь — нажми «✅ Сдал» в боте.")
+                                   "Когда сдашь — нажми «✅ Сдал» в боте.", important=True)
     if pos <= 1 and len(rest) > 1:
         await notify(bot, rest[1], f"⏳ Ты следующий в очереди «{title}» — готовься.")
+    await group_refresh(bot, qid)
     return True
 
 
@@ -285,6 +330,7 @@ async def send_to_end(bot: Bot, qid: int, uid: int) -> int | None:
     await remove_from_queue(bot, qid, uid)  # следующий получит «Твоя очередь!»
     await execute("INSERT INTO entries (queue_id, user_id, lab, retake) VALUES (?, ?, ?, 1)",
                   qid, uid, row[0])
+    await group_refresh(bot, qid)
     return len(await queue_members(qid))
 
 
@@ -386,6 +432,9 @@ async def create_queue(bot: Bot, key: str, title: str, starts: datetime,
         title, key, starts.isoformat(), ends.isoformat() if ends else None, info or None,
     )
     log.info("Создана очередь: %s", title)
+    q = await fetchone("SELECT id FROM queues WHERE rule_key = ?", key)
+    if q:
+        await group_refresh(bot, q[0])
     await announce(bot, title, groups, info)
 
 
@@ -401,6 +450,7 @@ async def sync_schedule(bot: Bot):
         members = await queue_members(qid)
         await execute("DELETE FROM entries WHERE queue_id = ?", qid)
         await execute("DELETE FROM queues WHERE id = ?", qid)
+        await group_refresh(bot, qid)
         for uid, *_ in members:
             await notify(bot, uid, f"⌛ Очередь «{esc(title)}» закрыта. "
                                    "Не успел — записывайся в следующий раз.")
@@ -449,6 +499,7 @@ async def sync_schedule(bot: Bot):
             members = await queue_members(qid)
             await execute("DELETE FROM entries WHERE queue_id = ?", qid)
             await execute("DELETE FROM queues WHERE id = ?", qid)
+            await group_refresh(bot, qid)
             for uid, *_ in members:
                 await notify(bot, uid, f"❌ «{esc(title)}» пропало из расписания на сайте — "
                                        "очередь убрана. Проверь расписание.")
@@ -588,6 +639,9 @@ ADMIN_HELP = (
     f"{BTN_ADD} — очередь, которая будет появляться сама (каждую неделю, день и т.д.).\n"
     f"{BTN_RULES} — список таких очередей и удаление.\n"
     f"{BTN_ADMINS} — назначить или убрать админов (только у главного).\n"
+    "<b>Группа:</b> добавь бота в чат группы админом (права «Удалять» и «Закреплять») "
+    "и отправь там /group — бот закрепит кнопку входа и будет вести посты об очередях. "
+    "Отключить: /ungroup.\n"
     "Внутри очереди есть кнопки [админ]: вызвать следующего, закрыть запись, удалить."
 )
 
@@ -596,10 +650,13 @@ async def is_registered(uid: int) -> bool:
     return bool(await fetchone("SELECT 1 FROM users WHERE tg_id = ?", uid))
 
 
-async def ask_registration(m: Message, state: FSMContext, greeting: bool = True):
+async def ask_registration(m: Message, state: FSMContext, greeting: bool = True,
+                           pending_q: int | None = None):
     await state.set_state(Reg.name)
+    if pending_q:
+        await state.update_data(pending_q=pending_q)
     text = WELCOME_TEXT if greeting else ""
-    await m.answer(text + "✍️ Напиши свои <b>фамилию и имя</b>:")
+    await say(m, text + "✍️ Напиши свои <b>фамилию и имя</b>:")
 
 
 WELCOME_TEXT = (
@@ -618,7 +675,7 @@ async def send_queues(m: Message, state: FSMContext):
         await ask_registration(m, state)
         return
     text, kb = await main_menu(m.from_user.id)
-    await m.answer(text, reply_markup=kb)
+    await say(m, text, reply_markup=kb)
 
 
 @router.message.outer_middleware()
@@ -630,7 +687,13 @@ async def remember_username(handler, event: Message, data):
                           "AND COALESCE(username, '') != ?", u.username, u.id, u.username)
         except Exception:
             pass
-    return await handler(event, data)
+    result = await handler(event, data)
+    if event.chat.type == "private":
+        try:
+            await event.delete()  # не засорять чат нажатиями кнопок и командами
+        except Exception:
+            pass
+    return result
 
 
 @router.message(F.text.in_(MENU_BUTTONS))
@@ -659,20 +722,26 @@ async def menu_button(m: Message, state: FSMContext):
 
 
 @router.message(CommandStart())
-async def cmd_start(m: Message, state: FSMContext):
+async def cmd_start(m: Message, state: FSMContext, command: CommandObject):
     await state.clear()
+    arg = (command.args or "").strip()
+    pending_q = int(arg[2:]) if arg.startswith("q_") and arg[2:].isdigit() else None
     if not await is_registered(m.from_user.id):
-        await ask_registration(m, state)
+        await ask_registration(m, state, pending_q=pending_q)
         return
-    await m.answer("Меню внизу экрана 👇", reply_markup=reply_kb(m.from_user.id))
+    await say(m, "Меню внизу экрана 👇", reply_markup=reply_kb(m.from_user.id), slot="kb")
+    if pending_q:
+        text, kb = await queue_view(pending_q, m.from_user.id)
+        if text:
+            await say(m, text, reply_markup=kb)
+            return
     await send_queues(m, state)
 
 
 @router.message(Command("help"))
 async def cmd_help(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer(HELP_TEXT + (ADMIN_HELP if is_admin(m.from_user.id) else ""),
-                   reply_markup=reply_kb(m.from_user.id))
+    await say(m, HELP_TEXT + (ADMIN_HELP if is_admin(m.from_user.id) else ""))
 
 
 @router.message(Command("my"))
@@ -686,7 +755,7 @@ async def cmd_my(m: Message, state: FSMContext):
         m.from_user.id,
     )
     if not rows:
-        await m.answer(f"Ты пока ни в одной очереди не стоишь. Открой {BTN_QUEUES}")
+        await say(m, f"Ты пока ни в одной очереди не стоишь. Открой {BTN_QUEUES}")
         return
     kb = InlineKeyboardBuilder()
     lines = ["<b>Мои записи</b>", ""]
@@ -695,7 +764,7 @@ async def cmd_my(m: Message, state: FSMContext):
         lines.append(f"• {esc(title)} — {mark}")
         kb.button(text=f"{title} · {pos}", callback_data=f"q:{qid}")
     kb.adjust(1)
-    await m.answer("\n".join(lines), reply_markup=kb.as_markup())
+    await say(m, "\n".join(lines), reply_markup=kb.as_markup())
 
 
 SCHEDULE_MODES = {"today": "Сегодня", "tomorrow": "Завтра", "week0": "Эта неделя",
@@ -769,7 +838,7 @@ async def schedule_view(uid: int, mode: str = "today"):
 async def cmd_schedule(m: Message, state: FSMContext):
     await state.clear()
     text, kb = await schedule_view(m.from_user.id)
-    await m.answer(text, reply_markup=kb)
+    await say(m, text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("sch:"))
@@ -808,37 +877,37 @@ async def cmd_profile(m: Message, state: FSMContext):
         await ask_registration(m, state)
         return
     text, kb = await profile_view(m.from_user.id)
-    await m.answer(text, reply_markup=kb)
+    await say(m, text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "editprofile")
 async def cb_editprofile(c: CallbackQuery, state: FSMContext):
     await state.set_state(Reg.name)
-    await c.message.answer("Напиши свои фамилию и имя:")
+    await say(c.message, "Напиши свои фамилию и имя:")
     await c.answer()
 
 
 @router.message(Command("id"))
 async def cmd_id(m: Message):
-    await m.answer(f"Твой Telegram ID: <code>{m.from_user.id}</code>")
+    await say(m, f"Твой Telegram ID: <code>{m.from_user.id}</code>")
 
 
 @router.message(Command("admin"))
 async def cmd_admin(m: Message):
     uid = m.from_user.id
     if is_admin(uid):
-        await m.answer("Ты уже админ.", reply_markup=reply_kb(uid))
+        await say(m, "Ты уже админ.", reply_markup=reply_kb(uid), slot="kb")
         return
     if admins:
-        await m.answer("Админ у бота уже есть.")
+        await say(m, "Админ у бота уже есть.")
         return
     await execute("INSERT OR REPLACE INTO admins (tg_id, role) VALUES (?, 'owner')", uid)
     admins.add(uid)
     owners.add(uid)
     await set_admin_commands(m.bot, uid)
-    await m.answer("👑 Теперь ты <b>главный админ</b> этого бота. Внизу появились кнопки "
+    await say(m, "👑 Теперь ты <b>главный админ</b> этого бота. Внизу появились кнопки "
                    f"{BTN_ADD}, {BTN_RULES} и {BTN_ADMINS}." + ADMIN_HELP,
-                   reply_markup=reply_kb(uid))
+                   reply_markup=reply_kb(uid), slot="kb")
 
 
 # ---------- управление админами (только главный админ) ----------
@@ -873,7 +942,7 @@ async def cmd_admins(m: Message, state: FSMContext):
     if not is_owner(m.from_user.id):
         return
     text, kb = await admins_view()
-    await m.answer(text, reply_markup=kb)
+    await say(m, text, reply_markup=kb)
 
 
 @router.callback_query(F.data == "adm_add")
@@ -882,7 +951,7 @@ async def cb_adm_add(c: CallbackQuery, state: FSMContext):
         await c.answer("Только для главного админа", show_alert=True)
         return
     await state.set_state(AddAdmin.who)
-    await c.message.answer(
+    await say(c.message, 
         "Кого сделать админом? Пришли его <b>@username</b> или <b>Telegram ID</b>.\n\n"
         "Человек должен хотя бы раз написать боту /start. "
         "Свой ID он может узнать командой /id.")
@@ -904,13 +973,13 @@ async def adm_add_who(m: Message, state: FSMContext):
         return
     found = await find_user(m.text)
     if not found:
-        await m.answer("Не нашёл такого пользователя 🤔 Попроси его написать боту /start "
+        await say(m, "Не нашёл такого пользователя 🤔 Попроси его написать боту /start "
                        "и пройти регистрацию, потом пришли @username или ID ещё раз.")
         return
     uid, name = found
     await state.clear()
     if uid in admins:
-        await m.answer(f"{esc(name)} уже админ.")
+        await say(m, f"{esc(name)} уже админ.")
     else:
         await execute("INSERT OR REPLACE INTO admins (tg_id, role) VALUES (?, 'admin')", uid)
         admins.add(uid)
@@ -921,9 +990,9 @@ async def adm_add_who(m: Message, state: FSMContext):
                      f"{BTN_ADD} и {BTN_RULES}." + ADMIN_HELP, reply_markup=reply_kb(uid))
         except Exception:
             pass
-        await m.answer(f"✅ {esc(name)} теперь админ.")
+        await say(m, f"✅ {esc(name)} теперь админ.")
     text, kb = await admins_view()
-    await m.answer(text, reply_markup=kb)
+    await say(m, text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("adm_del:"))
@@ -951,7 +1020,7 @@ async def cb_adm_del(c: CallbackQuery):
 async def reg_name(m: Message, state: FSMContext):
     await state.update_data(name=m.text.strip()[:64])
     await state.set_state(Reg.group)
-    await m.answer("Теперь номер группы:")
+    await say(m, "Теперь номер группы:")
 
 
 @router.message(Reg.group, F.text, ~F.text.in_(MENU_BUTTONS), ~F.text.startswith("/"))
@@ -962,16 +1031,22 @@ async def reg_group(m: Message, state: FSMContext):
         m.from_user.id, data["name"], m.text.strip()[:32], m.from_user.username,
     )
     await state.clear()
-    await m.answer("Готово ✅ Когда откроется новая очередь — пришлю уведомление.\n"
-                   "Меню внизу экрана 👇", reply_markup=reply_kb(m.from_user.id))
+    await say(m, "Готово ✅ Когда откроется новая очередь — пришлю уведомление.\n"
+                   "Меню внизу экрана 👇", reply_markup=reply_kb(m.from_user.id), slot="kb")
+    pending_q = data.get("pending_q")
+    if pending_q:
+        text, kb = await queue_view(pending_q, m.from_user.id)
+        if text:
+            await say(m, text, reply_markup=kb)
+            return
     text, kb = await main_menu(m.from_user.id)
-    await m.answer(text, reply_markup=kb)
+    await say(m, text, reply_markup=kb)
 
 
 @router.message(Reg.name)
 @router.message(Reg.group)
 async def reg_hint(m: Message):
-    await m.answer("Сначала закончим регистрацию — напиши текстом, пожалуйста 🙂")
+    await say(m, "Сначала закончим регистрацию — напиши текстом, пожалуйста 🙂")
 
 
 @router.callback_query(F.data == "menu")
@@ -1071,7 +1146,7 @@ async def cb_join(c: CallbackQuery, state: FSMContext):
         return
     await state.set_state(Join.lab)
     await state.update_data(qid=qid)
-    await c.message.answer("Какую лабу сдаёшь? Напиши номер (или «-», если неважно):")
+    await say(c.message, "Какую лабу сдаёшь? Напиши номер (или «-», если неважно):")
     await c.answer()
 
 
@@ -1081,14 +1156,15 @@ async def join_lab(m: Message, state: FSMContext):
     await state.clear()
     q = await fetchone("SELECT is_open FROM queues WHERE id = ?", qid)
     if not q or not q[0]:
-        await m.answer("Пока ты писал, запись закрыли 😕")
+        await say(m, "Пока ты писал, запись закрыли 😕")
         return
     await execute(
         "INSERT OR IGNORE INTO entries (queue_id, user_id, lab) VALUES (?, ?, ?)",
         qid, m.from_user.id, m.text.strip()[:32],
     )
+    await group_refresh(m.bot, qid)
     text, kb = await queue_view(qid, m.from_user.id)
-    await m.answer(text, reply_markup=kb)
+    await say(m, text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("retake:"))
@@ -1155,6 +1231,7 @@ async def cb_toggle(c: CallbackQuery):
         return
     qid = int(c.data.split(":")[1])
     await execute("UPDATE queues SET is_open = 1 - is_open WHERE id = ?", qid)
+    await group_refresh(c.bot, qid)
     await show_queue(c, qid)
 
 
@@ -1181,6 +1258,7 @@ async def cb_delok(c: CallbackQuery):
     members = await queue_members(qid)
     await execute("DELETE FROM entries WHERE queue_id = ?", qid)
     await execute("DELETE FROM queues WHERE id = ?", qid)
+    await group_refresh(c.bot, qid)
     if q:
         for uid, *_ in members:
             await notify(c.bot, uid, f"❌ Очередь «{esc(q[0])}» отменена.")
@@ -1210,14 +1288,14 @@ async def cmd_add(m: Message, state: FSMContext):
         return
     await state.clear()
     await state.set_state(AddRule.title)
-    await m.answer("Название очереди? Например: <i>ОАиП, лабы, ауд. 305</i>")
+    await say(m, "Название очереди? Например: <i>ОАиП, лабы, ауд. 305</i>")
 
 
 @router.message(AddRule.title, F.text, ~F.text.startswith("/"))
 async def add_title(m: Message, state: FSMContext):
     await state.update_data(title=m.text.strip()[:80])
     await state.set_state(AddRule.when)
-    await m.answer(f"Когда очередь появится в первый раз?\n"
+    await say(m, f"Когда очередь появится в первый раз?\n"
                    f"Формат: <code>ДД.ММ ЧЧ:ММ</code>, например <code>{now():%d.%m} 18:00</code>")
 
 
@@ -1225,7 +1303,7 @@ async def add_title(m: Message, state: FSMContext):
 async def add_when(m: Message, state: FSMContext):
     when = parse_when(m.text)
     if not when:
-        await m.answer("Не понял дату 🤔 Напиши так: <code>03.11 18:00</code>")
+        await say(m, "Не понял дату 🤔 Напиши так: <code>03.11 18:00</code>")
         return
     await state.update_data(when=when.isoformat())
     await state.set_state(None)
@@ -1233,7 +1311,7 @@ async def add_when(m: Message, state: FSMContext):
     for days, label in PERIODS.items():
         kb.button(text=label, callback_data=f"addp:{days}")
     kb.adjust(2)
-    await m.answer(f"Первое появление: <b>{fmt_dt(when)}</b>\nКак часто повторять?",
+    await say(m, f"Первое появление: <b>{fmt_dt(when)}</b>\nКак часто повторять?",
                    reply_markup=kb.as_markup())
 
 
@@ -1304,7 +1382,7 @@ async def cmd_rules(m: Message):
     if not is_admin(m.from_user.id):
         return
     text, kb = await rules_view()
-    await m.answer(text, reply_markup=kb)
+    await say(m, text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("rdel:"))
@@ -1317,6 +1395,189 @@ async def cb_rdel(c: CallbackQuery):
     await safe_edit(c, text, kb)
     await c.answer(f"Правило №{rid} удалено. Уже открытая очередь осталась — её можно удалить вручную.",
                    show_alert=True)
+
+
+# ---------- группа: «живые» сообщения об очередях ----------
+
+async def get_setting(key: str) -> str | None:
+    row = await fetchone("SELECT value FROM settings WHERE key = ?", key)
+    return row[0] if row else None
+
+
+async def set_setting(key: str, value) -> None:
+    await execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                  "ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, str(value))
+
+
+async def bot_username(bot: Bot) -> str:
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        BOT_USERNAME = (await bot.get_me()).username
+    return BOT_USERNAME
+
+
+async def deep_link(bot: Bot, payload: str = "") -> str:
+    url = f"https://t.me/{await bot_username(bot)}"
+    return f"{url}?start={payload}" if payload else url
+
+
+async def group_post_content(bot: Bot, qid: int):
+    q = await fetchone("SELECT title, is_open, info FROM queues WHERE id = ?", qid)
+    if not q:
+        return None, None
+    title, is_open, info = q
+    members = await queue_members(qid)
+    lines = [f"🧪 <b>{esc(title)}</b>"]
+    if info:
+        lines.append(f"<i>{esc(info)}</i>")
+    lines.append("")
+    lines.append(f"👥 В очереди: <b>{len(members)}</b>")
+    if members:
+        lines.append(f"▶️ Сейчас сдаёт: {esc(members[0][1])}")
+    if len(members) > 1:
+        lines.append(f"⏳ Следующий: {esc(members[1][1])}")
+    if not is_open:
+        lines.append("🔒 Запись закрыта")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="✋ Встать в очередь" if is_open else "👀 Открыть очередь",
+        url=await deep_link(bot, f"q_{qid}"))]])
+    return "\n".join(lines), kb
+
+
+_group_lock = asyncio.Lock()
+
+
+async def group_refresh(bot: Bot, qid: int):
+    """Создать, обновить или удалить пост об очереди в группе."""
+    try:
+        chat = await get_setting("group_chat_id")
+        if not chat:
+            return
+        chat_id = int(chat)
+        async with _group_lock:
+            post = await fetchone("SELECT message_id FROM group_posts WHERE queue_id = ?", qid)
+            text, kb = await group_post_content(bot, qid)
+            if text is None:  # очередь закрыта/удалена — убрать пост
+                if post:
+                    await execute("DELETE FROM group_posts WHERE queue_id = ?", qid)
+                    try:
+                        await bot.delete_message(chat_id, post[0])
+                    except Exception:
+                        pass
+                return
+            if post:
+                try:
+                    await bot.edit_message_text(text, chat_id=chat_id, message_id=post[0],
+                                                reply_markup=kb)
+                    return
+                except TelegramBadRequest as e:
+                    if "not modified" in str(e):
+                        return
+                    # сообщение удалили руками — отправим заново
+            msg = await bot.send_message(chat_id, text, reply_markup=kb,
+                                         disable_notification=True)
+            await execute("INSERT OR REPLACE INTO group_posts (queue_id, message_id) VALUES (?, ?)",
+                          qid, msg.message_id)
+    except Exception as e:
+        log.warning("Не удалось обновить пост в группе: %s", e)
+
+
+GROUP_PIN_TEXT = (
+    "🤖 <b>Бот группы</b>\n\n"
+    "📅 Актуальное расписание пар\n"
+    "🧪 Очередь на сдачу лаб — открывается сама в начале пары\n"
+    "🔔 Бот напишет в личку, когда подойдёт твоя очередь\n\n"
+    "Нажми кнопку и зарегистрируйся один раз 👇"
+)
+
+
+async def delete_later(bot: Bot, chat_id: int, *ids: int, delay: int = 60):
+    await asyncio.sleep(delay)
+    for i in ids:
+        try:
+            await bot.delete_message(chat_id, i)
+        except Exception:
+            pass
+
+
+@group_router.message(Command("group"))
+async def grp_setup(m: Message):
+    if not is_admin(m.from_user.id):
+        asyncio.create_task(delete_later(m.bot, m.chat.id, m.message_id, delay=1))
+        return
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    old_chat, old_pin = await get_setting("group_chat_id"), await get_setting("group_pin_id")
+    if old_chat and old_pin:
+        try:
+            await m.bot.delete_message(int(old_chat), int(old_pin))
+        except Exception:
+            pass
+    if old_chat and int(old_chat) != m.chat.id:  # переехали в другую группу
+        for (mid,) in await fetchall("SELECT message_id FROM group_posts"):
+            try:
+                await m.bot.delete_message(int(old_chat), mid)
+            except Exception:
+                pass
+    await execute("DELETE FROM group_posts")
+    await set_setting("group_chat_id", m.chat.id)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="🚀 Открыть бота", url=await deep_link(m.bot, "hi"))]])
+    pin = await m.bot.send_message(m.chat.id, GROUP_PIN_TEXT, reply_markup=kb)
+    await set_setting("group_pin_id", pin.message_id)
+    problems = []
+    try:
+        await m.bot.pin_chat_message(m.chat.id, pin.message_id, disable_notification=True)
+    except Exception:
+        problems.append("закреплять сообщения")
+    for (qid,) in await fetchall("SELECT id FROM queues"):
+        await group_refresh(m.bot, qid)
+
+    report = "✅ Группа подключена. Тут будут появляться открытые очереди."
+    if problems:
+        report += ("\n⚠️ Не хватает прав: " + ", ".join(problems) +
+                   ". Сделай бота админом группы с правами «Удалять сообщения» и «Закреплять».")
+    await notify(m.bot, m.from_user.id, report)
+
+
+@group_router.message(Command("ungroup"))
+async def grp_off(m: Message):
+    if not is_admin(m.from_user.id):
+        return
+    try:
+        await m.delete()
+    except Exception:
+        pass
+    for (mid,) in await fetchall("SELECT message_id FROM group_posts"):
+        try:
+            await m.bot.delete_message(m.chat.id, mid)
+        except Exception:
+            pass
+    pin = await get_setting("group_pin_id")
+    if pin:
+        try:
+            await m.bot.delete_message(m.chat.id, int(pin))
+        except Exception:
+            pass
+    await execute("DELETE FROM group_posts")
+    await execute("DELETE FROM settings WHERE key IN ('group_chat_id', 'group_pin_id')")
+    await notify(m.bot, m.from_user.id, "Группа отключена, посты убраны.")
+
+
+@group_router.message(F.text.startswith("/"))
+async def grp_any_command(m: Message):
+    """Любая другая команда в группе: подсказка «в личку», которая исчезает через минуту."""
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="💬 Открыть бота в личке", url=await deep_link(m.bot, "hi"))]])
+    try:
+        hint = await m.reply("Я работаю в личке 🙂", reply_markup=kb,
+                             disable_notification=True)
+        asyncio.create_task(delete_later(m.bot, m.chat.id, m.message_id, hint.message_id))
+    except Exception:
+        pass
 
 
 # ---------- запуск ----------
@@ -1343,6 +1604,7 @@ async def main():
     except Exception as e:
         log.warning("Не удалось задать меню команд (нет связи с Telegram?): %s", e)
     dp = Dispatcher()
+    dp.include_router(group_router)
     dp.include_router(router)
     if KSTU_GROUP:
         asyncio.create_task(kstu_loop())

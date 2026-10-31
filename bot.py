@@ -10,7 +10,10 @@
 """
 # Версия бота: при каждой правке увеличиваем.
 # 2.1 — версия видна в «Помощи», в /version и в логах при запуске
-BOT_VERSION = "2.1"
+# 2.2 — база и кэш расписания хранятся в постоянной папке хостинга (DATA_DIR)
+# 2.3 — админы видят список зарегистрированных студентов (кнопка «👥 Студенты», /users)
+# 2.4 — группа при регистрации выбирается кнопкой (пока одна: 861-ТОП242)
+BOT_VERSION = "2.4"
 
 import asyncio
 import html
@@ -49,7 +52,10 @@ TG_PROXY = os.getenv("TG_PROXY", "").strip()
 ENV_ADMINS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x
 }
-DB_PATH = os.getenv("DB_PATH", "queue.db")
+# постоянная папка для данных: Bothost задаёт DATA_DIR=/app/data, она не стирается при пересборке
+DATA_DIR = os.getenv("DATA_DIR", ".")
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.getenv("DB_PATH") or os.path.join(DATA_DIR, "queue.db")
 SCHEDULE_PATH = os.getenv("SCHEDULE_PATH", "schedule.json")
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))
 OPEN_BEFORE_HOURS = float(os.getenv("OPEN_BEFORE_HOURS", "24"))
@@ -57,11 +63,13 @@ CHECK_INTERVAL_SEC = 30
 
 # расписание с kstu.ru (пусто в KSTU_GROUP — выключено)
 KSTU_GROUP = os.getenv("KSTU_GROUP", "49396").strip()
+# группы, которые можно выбрать при регистрации (через запятую). Новую группу — добавить сюда
+GROUPS = [g.strip() for g in os.getenv("GROUPS", "861-ТОП242").split(",") if g.strip()]
 KSTU_FACULTY = os.getenv("KSTU_FACULTY", "320").strip()
 KSTU_KINDS = {k.strip().upper() for k in os.getenv("KSTU_KINDS", "ЛР").split(",") if k.strip()}
 KSTU_OPEN_BEFORE_HOURS = float(os.getenv("KSTU_OPEN_BEFORE_HOURS", "0"))  # 0 = в начале пары
 KSTU_REFRESH_HOURS = float(os.getenv("KSTU_REFRESH_HOURS", "3"))
-KSTU_CACHE = os.getenv("KSTU_CACHE", "kstu_cache.json")
+KSTU_CACHE = os.getenv("KSTU_CACHE") or os.path.join(DATA_DIR, "kstu_cache.json")
 
 WEEKDAYS = {"пн": 0, "вт": 1, "ср": 2, "чт": 3, "пт": 4, "сб": 5, "вс": 6}
 WEEKDAY_NAMES = list(WEEKDAYS)
@@ -87,8 +95,9 @@ BTN_LABS = "📅 Расписание"
 BTN_ADD = "➕ Новая очередь"
 BTN_RULES = "🔁 Повторы"
 BTN_ADMINS = "👑 Админы"
+BTN_USERS = "👥 Студенты"
 MENU_BUTTONS = {BTN_QUEUES, BTN_MINE, BTN_LABS, BTN_PROFILE, BTN_HELP, BTN_ADD, BTN_RULES,
-                BTN_ADMINS}
+                BTN_ADMINS, BTN_USERS}
 
 STUDENT_COMMANDS = [
     BotCommand(command="start", description="Открыть очереди"),
@@ -101,6 +110,7 @@ STUDENT_COMMANDS = [
 ADMIN_COMMANDS = STUDENT_COMMANDS + [
     BotCommand(command="add", description="Новая повторяющаяся очередь"),
     BotCommand(command="rules", description="Повторяющиеся очереди"),
+    BotCommand(command="users", description="Зарегистрированные студенты"),
 ]
 OWNER_COMMANDS = ADMIN_COMMANDS + [
     BotCommand(command="admins", description="Управление админами"),
@@ -114,7 +124,8 @@ def reply_kb(uid: int) -> ReplyKeyboardMarkup:
          KeyboardButton(text=BTN_HELP)],
     ]
     if uid in admins:
-        admin_row = [KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_RULES)]
+        rows.append([KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_RULES)])
+        admin_row = [KeyboardButton(text=BTN_USERS)]
         if uid in owners:
             admin_row.append(KeyboardButton(text=BTN_ADMINS))
         rows.append(admin_row)
@@ -129,7 +140,8 @@ CREATE TABLE IF NOT EXISTS users (
     tg_id     INTEGER PRIMARY KEY,
     full_name TEXT NOT NULL,
     grp       TEXT NOT NULL,
-    username  TEXT
+    username  TEXT,
+    created_at TEXT
 );
 CREATE TABLE IF NOT EXISTS queues (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -195,6 +207,8 @@ async def init_db():
             ucols = {row[1] for row in await cur.fetchall()}
         if ucols and "username" not in ucols:
             await db.execute("ALTER TABLE users ADD COLUMN username TEXT")
+        if ucols and "created_at" not in ucols:
+            await db.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
         async with db.execute("PRAGMA table_info(admins)") as cur:
             acols = {row[1] for row in await cur.fetchall()}
         if acols and "role" not in acols:
@@ -643,6 +657,7 @@ ADMIN_HELP = (
     "\n\n<b>Для админа</b>\n"
     f"{BTN_ADD} — очередь, которая будет появляться сама (каждую неделю, день и т.д.).\n"
     f"{BTN_RULES} — список таких очередей и удаление.\n"
+    f"{BTN_USERS} — сколько человек зарегистрировалось и кто они.\n"
     f"{BTN_ADMINS} — назначить или убрать админов (только у главного).\n"
     "<b>Группа:</b> добавь бота в чат группы админом (права «Удалять» и «Закреплять») "
     "и отправь там /group — бот закрепит кнопку входа и будет вести посты об очередях. "
@@ -720,6 +735,8 @@ async def menu_button(m: Message, state: FSMContext):
         await cmd_help(m, state)
     elif t == BTN_ADD and is_admin(m.from_user.id):
         await cmd_add(m, state)
+    elif t == BTN_USERS and is_admin(m.from_user.id):
+        await cmd_users(m, state)
     elif t == BTN_ADMINS and is_owner(m.from_user.id):
         await cmd_admins(m, state)
     elif t == BTN_RULES and is_admin(m.from_user.id):
@@ -922,6 +939,72 @@ async def cmd_admin(m: Message):
                    reply_markup=reply_kb(uid), slot="kb")
 
 
+# ---------- список студентов (для админов) ----------
+
+USERS_PAGE = 30
+
+
+async def users_view(page: int = 0):
+    total = (await fetchone("SELECT COUNT(*) FROM users"))[0]
+    pages = max(1, (total + USERS_PAGE - 1) // USERS_PAGE)
+    page = min(max(page, 0), pages - 1)
+    rows = await fetchall(
+        "SELECT tg_id, full_name, grp, username, created_at FROM users "
+        "ORDER BY full_name COLLATE NOCASE LIMIT ? OFFSET ?", USERS_PAGE, page * USERS_PAGE)
+    by_group = await fetchall("SELECT grp, COUNT(*) FROM users GROUP BY grp ORDER BY COUNT(*) DESC")
+    week_ago = (now() - timedelta(days=7)).isoformat(timespec="minutes")
+    new_week = (await fetchone("SELECT COUNT(*) FROM users WHERE created_at >= ?", week_ago))[0]
+
+    lines = [f"<b>👥 Зарегистрировано: {total}</b>"]
+    if new_week:
+        lines.append(f"🆕 За последнюю неделю: {new_week}")
+    if len(by_group) > 1:
+        lines.append("По группам: " + ", ".join(f"{esc(g)} — {n}" for g, n in by_group))
+    lines.append("")
+    for i, (uid, name, grp, uname, created) in enumerate(rows, page * USERS_PAGE + 1):
+        line = f"{i}. {esc(name)} · {esc(grp)}"
+        if uname:
+            line += f" · @{esc(uname)}"
+        if uid in owners:
+            line += " 👑"
+        elif uid in admins:
+            line += " 🛠"
+        if created:
+            line += f" <i>({datetime.fromisoformat(created):%d.%m})</i>"
+        lines.append(line)
+    if not rows:
+        lines.append("Пока никто не зарегистрировался.")
+
+    kb = InlineKeyboardBuilder()
+    if pages > 1:
+        if page > 0:
+            kb.button(text="◀️", callback_data=f"users:{page - 1}")
+        kb.button(text=f"{page + 1} / {pages}", callback_data=f"users:{page}")
+        if page < pages - 1:
+            kb.button(text="▶️", callback_data=f"users:{page + 1}")
+    kb.button(text="🔄 Обновить", callback_data=f"users:{page}")
+    kb.adjust(3, 1)
+    return "\n".join(lines), kb.as_markup()
+
+
+@router.message(Command("users"))
+async def cmd_users(m: Message, state: FSMContext):
+    await state.clear()
+    if not is_admin(m.from_user.id):
+        return
+    text, kb = await users_view()
+    await say(m, text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("users:"))
+async def cb_users(c: CallbackQuery):
+    if not await admin_guard(c):
+        return
+    text, kb = await users_view(int(c.data.split(":")[1]))
+    await safe_edit(c, text, kb)
+    await c.answer()
+
+
 # ---------- управление админами (только главный админ) ----------
 
 async def admins_view():
@@ -1032,33 +1115,59 @@ async def cb_adm_del(c: CallbackQuery):
 async def reg_name(m: Message, state: FSMContext):
     await state.update_data(name=m.text.strip()[:64])
     await state.set_state(Reg.group)
-    await say(m, "Теперь номер группы:")
+    await ask_group(m)
 
 
-@router.message(Reg.group, F.text, ~F.text.in_(MENU_BUTTONS), ~F.text.startswith("/"))
-async def reg_group(m: Message, state: FSMContext):
+async def ask_group(m: Message):
+    kb = InlineKeyboardBuilder()
+    for i, g in enumerate(GROUPS):
+        kb.button(text=f"🎓 {g}", callback_data=f"reggrp:{i}")
+    kb.adjust(1)
+    await say(m, "👇 Выбери свою <b>группу</b>:", reply_markup=kb.as_markup())
+
+
+@router.callback_query(F.data.startswith("reggrp:"))
+async def reg_group(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    if "name" not in data:
+        await c.answer("Начни заново: /start", show_alert=True)
+        return
+    i = int(c.data.split(":")[1])
+    if not 0 <= i < len(GROUPS):
+        await c.answer("Такой группы нет", show_alert=True)
+        return
+    uid = c.from_user.id
     await execute(
-        "INSERT OR REPLACE INTO users (tg_id, full_name, grp, username) VALUES (?, ?, ?, ?)",
-        m.from_user.id, data["name"], m.text.strip()[:32], m.from_user.username,
+        "INSERT INTO users (tg_id, full_name, grp, username, created_at) VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(tg_id) DO UPDATE SET full_name = excluded.full_name, grp = excluded.grp, "
+        "username = excluded.username",  # дата регистрации при смене имени не меняется
+        uid, data["name"], GROUPS[i], c.from_user.username,
+        now().isoformat(timespec="minutes"),
     )
     await state.clear()
-    await say(m, "Готово ✅ Когда откроется новая очередь — пришлю уведомление.\n"
-                   "Меню внизу экрана 👇", reply_markup=reply_kb(m.from_user.id), slot="kb")
+    await c.answer(f"Группа {GROUPS[i]} ✅")
+    m = c.message
+    await say(m, f"Готово ✅ {esc(data['name'])}, {esc(GROUPS[i])}.\n"
+                 "Когда откроется новая очередь — пришлю уведомление.\n"
+                 "Меню внизу экрана 👇", reply_markup=reply_kb(uid), slot="kb")
     pending_q = data.get("pending_q")
     if pending_q:
-        text, kb = await queue_view(pending_q, m.from_user.id)
+        text, kb = await queue_view(pending_q, uid)
         if text:
             await say(m, text, reply_markup=kb)
             return
-    text, kb = await main_menu(m.from_user.id)
+    text, kb = await main_menu(uid)
     await say(m, text, reply_markup=kb)
 
 
-@router.message(Reg.name)
 @router.message(Reg.group)
+async def reg_group_hint(m: Message):
+    await ask_group(m)
+
+
+@router.message(Reg.name)
 async def reg_hint(m: Message):
-    await say(m, "Сначала закончим регистрацию — напиши текстом, пожалуйста 🙂")
+    await say(m, "Сначала закончим регистрацию — напиши фамилию и имя текстом 🙂")
 
 
 @router.callback_query(F.data == "menu")
@@ -1604,7 +1713,7 @@ async def set_admin_commands(bot: Bot, uid: int):
 
 async def main():
     logging.basicConfig(level=logging.INFO)
-    log.info("Запуск бота, версия %s", BOT_VERSION)
+    log.info("Запуск бота, версия %s, база: %s", BOT_VERSION, os.path.abspath(DB_PATH))
     await init_db()
     session = AiohttpSession(proxy=TG_PROXY) if TG_PROXY else None
     if TG_PROXY:

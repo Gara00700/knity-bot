@@ -68,6 +68,7 @@ DURATIONS = {2: "2 часа", 4: "4 часа", 24: "сутки", -1: "до сл�
 router = Router()
 log = logging.getLogger("queue-bot")
 admins: set[int] = set(ENV_ADMINS)
+owners: set[int] = set(ENV_ADMINS)  # главные админы: могут назначать других
 
 # кнопки постоянной клавиатуры
 BTN_QUEUES = "📋 Очереди"
@@ -77,7 +78,9 @@ BTN_HELP = "ℹ️ Помощь"
 BTN_LABS = "📅 Расписание"
 BTN_ADD = "➕ Новая очередь"
 BTN_RULES = "🔁 Повторы"
-MENU_BUTTONS = {BTN_QUEUES, BTN_MINE, BTN_LABS, BTN_PROFILE, BTN_HELP, BTN_ADD, BTN_RULES}
+BTN_ADMINS = "👑 Админы"
+MENU_BUTTONS = {BTN_QUEUES, BTN_MINE, BTN_LABS, BTN_PROFILE, BTN_HELP, BTN_ADD, BTN_RULES,
+                BTN_ADMINS}
 
 STUDENT_COMMANDS = [
     BotCommand(command="start", description="Открыть очереди"),
@@ -90,6 +93,9 @@ ADMIN_COMMANDS = STUDENT_COMMANDS + [
     BotCommand(command="add", description="Новая повторяющаяся очередь"),
     BotCommand(command="rules", description="Повторяющиеся очереди"),
 ]
+OWNER_COMMANDS = ADMIN_COMMANDS + [
+    BotCommand(command="admins", description="Управление админами"),
+]
 
 
 def reply_kb(uid: int) -> ReplyKeyboardMarkup:
@@ -99,7 +105,10 @@ def reply_kb(uid: int) -> ReplyKeyboardMarkup:
          KeyboardButton(text=BTN_HELP)],
     ]
     if uid in admins:
-        rows.append([KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_RULES)])
+        admin_row = [KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_RULES)]
+        if uid in owners:
+            admin_row.append(KeyboardButton(text=BTN_ADMINS))
+        rows.append(admin_row)
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True,
                                input_field_placeholder="Выбери действие ниже")
 
@@ -110,7 +119,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     tg_id     INTEGER PRIMARY KEY,
     full_name TEXT NOT NULL,
-    grp       TEXT NOT NULL
+    grp       TEXT NOT NULL,
+    username  TEXT
 );
 CREATE TABLE IF NOT EXISTS queues (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,7 +149,8 @@ CREATE TABLE IF NOT EXISTS rules (
     duration_h  INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS admins (
-    tg_id INTEGER PRIMARY KEY
+    tg_id INTEGER PRIMARY KEY,
+    role  TEXT NOT NULL DEFAULT 'admin'
 );
 """
 
@@ -157,10 +168,22 @@ async def init_db():
             ecols = {row[1] for row in await cur.fetchall()}
         if ecols and "retake" not in ecols:
             await db.execute("ALTER TABLE entries ADD COLUMN retake INTEGER NOT NULL DEFAULT 0")
+        async with db.execute("PRAGMA table_info(users)") as cur:
+            ucols = {row[1] for row in await cur.fetchall()}
+        if ucols and "username" not in ucols:
+            await db.execute("ALTER TABLE users ADD COLUMN username TEXT")
+        async with db.execute("PRAGMA table_info(admins)") as cur:
+            acols = {row[1] for row in await cur.fetchall()}
+        if acols and "role" not in acols:
+            # в старой версии админ был один — он и становится главным
+            await db.execute("ALTER TABLE admins ADD COLUMN role TEXT NOT NULL DEFAULT 'owner'")
         await db.executescript(SCHEMA)
         await db.commit()
-        async with db.execute("SELECT tg_id FROM admins") as cur:
-            admins.update(row[0] for row in await cur.fetchall())
+        async with db.execute("SELECT tg_id, role FROM admins") as cur:
+            for uid, role in await cur.fetchall():
+                admins.add(uid)
+                if role == "owner":
+                    owners.add(uid)
 
 
 async def execute(sql, *args):
@@ -195,6 +218,10 @@ async def queue_members(qid):
 
 def is_admin(uid: int) -> bool:
     return uid in admins
+
+
+def is_owner(uid: int) -> bool:
+    return uid in owners
 
 
 def esc(s) -> str:
@@ -268,6 +295,10 @@ class Reg(StatesGroup):
 
 class Join(StatesGroup):
     lab = State()
+
+
+class AddAdmin(StatesGroup):
+    who = State()
 
 
 class AddRule(StatesGroup):
@@ -556,6 +587,7 @@ ADMIN_HELP = (
     "\n\n<b>Для админа</b>\n"
     f"{BTN_ADD} — очередь, которая будет появляться сама (каждую неделю, день и т.д.).\n"
     f"{BTN_RULES} — список таких очередей и удаление.\n"
+    f"{BTN_ADMINS} — назначить или убрать админов (только у главного).\n"
     "Внутри очереди есть кнопки [админ]: вызвать следующего, закрыть запись, удалить."
 )
 
@@ -566,8 +598,18 @@ async def is_registered(uid: int) -> bool:
 
 async def ask_registration(m: Message, state: FSMContext, greeting: bool = True):
     await state.set_state(Reg.name)
-    text = "Привет! Это бот очереди на сдачу лаб.\n" if greeting else ""
-    await m.answer(text + "Напиши свои фамилию и имя:")
+    text = WELCOME_TEXT if greeting else ""
+    await m.answer(text + "✍️ Напиши свои <b>фамилию и имя</b>:")
+
+
+WELCOME_TEXT = (
+    "👋 <b>ХАЙ!</b> Это бот-помощник для студентов.\n\n"
+    "Здесь можно:\n"
+    "📅 узнать актуальное расписание\n"
+    "🧪 занять очередь на сдачу лабы\n\n"
+    "👨‍💻 Создатели: @SA16kzn и @tnegilletnii\n"
+    "🐞 Нашли баг или есть идея? Пишите нам ✅\n\n"
+)
 
 
 async def send_queues(m: Message, state: FSMContext):
@@ -577,6 +619,18 @@ async def send_queues(m: Message, state: FSMContext):
         return
     text, kb = await main_menu(m.from_user.id)
     await m.answer(text, reply_markup=kb)
+
+
+@router.message.outer_middleware()
+async def remember_username(handler, event: Message, data):
+    u = event.from_user
+    if u and u.username:
+        try:
+            await execute("UPDATE users SET username = ? WHERE tg_id = ? "
+                          "AND COALESCE(username, '') != ?", u.username, u.id, u.username)
+        except Exception:
+            pass
+    return await handler(event, data)
 
 
 @router.message(F.text.in_(MENU_BUTTONS))
@@ -598,6 +652,8 @@ async def menu_button(m: Message, state: FSMContext):
         await cmd_help(m, state)
     elif t == BTN_ADD and is_admin(m.from_user.id):
         await cmd_add(m, state)
+    elif t == BTN_ADMINS and is_owner(m.from_user.id):
+        await cmd_admins(m, state)
     elif t == BTN_RULES and is_admin(m.from_user.id):
         await cmd_rules(m)
 
@@ -776,11 +832,119 @@ async def cmd_admin(m: Message):
     if admins:
         await m.answer("Админ у бота уже есть.")
         return
-    await execute("INSERT OR IGNORE INTO admins (tg_id) VALUES (?)", uid)
+    await execute("INSERT OR REPLACE INTO admins (tg_id, role) VALUES (?, 'owner')", uid)
     admins.add(uid)
+    owners.add(uid)
     await set_admin_commands(m.bot, uid)
-    await m.answer("👑 Теперь ты админ этого бота. Внизу появились кнопки "
-                   f"{BTN_ADD} и {BTN_RULES}." + ADMIN_HELP, reply_markup=reply_kb(uid))
+    await m.answer("👑 Теперь ты <b>главный админ</b> этого бота. Внизу появились кнопки "
+                   f"{BTN_ADD}, {BTN_RULES} и {BTN_ADMINS}." + ADMIN_HELP,
+                   reply_markup=reply_kb(uid))
+
+
+# ---------- управление админами (только главный админ) ----------
+
+async def admins_view():
+    rows = await fetchall(
+        """SELECT a.tg_id, a.role, u.full_name, u.grp, u.username
+           FROM admins a LEFT JOIN users u ON u.tg_id = a.tg_id
+           ORDER BY a.role = 'owner' DESC, u.full_name""")
+    lines = ["<b>👑 Админы бота</b>", ""]
+    kb = InlineKeyboardBuilder()
+    for uid, role, name, grp, uname in rows:
+        who = esc(name) if name else f"ID {uid}"
+        if grp:
+            who += f" ({esc(grp)})"
+        if uname:
+            who += f" @{esc(uname)}"
+        lines.append(("👑 " if role == "owner" else "🛠 ") + who
+                     + (" — главный" if role == "owner" else ""))
+        if role != "owner":
+            kb.button(text=f"❌ Убрать {name or uid}", callback_data=f"adm_del:{uid}")
+    lines += ["", "🛠 Админы могут создавать и закрывать очереди, вызывать следующего, "
+              "отправлять на пересдачу.", "👑 Назначать админов может только главный."]
+    kb.button(text="➕ Добавить админа", callback_data="adm_add")
+    kb.adjust(1)
+    return "\n".join(lines), kb.as_markup()
+
+
+@router.message(Command("admins"))
+async def cmd_admins(m: Message, state: FSMContext):
+    await state.clear()
+    if not is_owner(m.from_user.id):
+        return
+    text, kb = await admins_view()
+    await m.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "adm_add")
+async def cb_adm_add(c: CallbackQuery, state: FSMContext):
+    if not is_owner(c.from_user.id):
+        await c.answer("Только для главного админа", show_alert=True)
+        return
+    await state.set_state(AddAdmin.who)
+    await c.message.answer(
+        "Кого сделать админом? Пришли его <b>@username</b> или <b>Telegram ID</b>.\n\n"
+        "Человек должен хотя бы раз написать боту /start. "
+        "Свой ID он может узнать командой /id.")
+    await c.answer()
+
+
+async def find_user(text: str):
+    t = text.strip()
+    if t.lstrip("-").isdigit():
+        return await fetchone("SELECT tg_id, full_name FROM users WHERE tg_id = ?", int(t))
+    uname = t.lstrip("@").lower()
+    return await fetchone("SELECT tg_id, full_name FROM users WHERE lower(username) = ?", uname)
+
+
+@router.message(AddAdmin.who, F.text, ~F.text.startswith("/"))
+async def adm_add_who(m: Message, state: FSMContext):
+    if not is_owner(m.from_user.id):
+        await state.clear()
+        return
+    found = await find_user(m.text)
+    if not found:
+        await m.answer("Не нашёл такого пользователя 🤔 Попроси его написать боту /start "
+                       "и пройти регистрацию, потом пришли @username или ID ещё раз.")
+        return
+    uid, name = found
+    await state.clear()
+    if uid in admins:
+        await m.answer(f"{esc(name)} уже админ.")
+    else:
+        await execute("INSERT OR REPLACE INTO admins (tg_id, role) VALUES (?, 'admin')", uid)
+        admins.add(uid)
+        await set_admin_commands(m.bot, uid)
+        try:
+            await m.bot.send_message(
+                uid, "🛠 Тебя назначили <b>админом</b> бота. Внизу появились кнопки "
+                     f"{BTN_ADD} и {BTN_RULES}." + ADMIN_HELP, reply_markup=reply_kb(uid))
+        except Exception:
+            pass
+        await m.answer(f"✅ {esc(name)} теперь админ.")
+    text, kb = await admins_view()
+    await m.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("adm_del:"))
+async def cb_adm_del(c: CallbackQuery):
+    if not is_owner(c.from_user.id):
+        await c.answer("Только для главного админа", show_alert=True)
+        return
+    uid = int(c.data.split(":")[1])
+    if uid in owners:
+        await c.answer("Главного админа убрать нельзя", show_alert=True)
+        return
+    await execute("DELETE FROM admins WHERE tg_id = ?", uid)
+    admins.discard(uid)
+    try:
+        await c.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=uid))
+        await c.bot.send_message(uid, "Ты больше не админ бота.", reply_markup=reply_kb(uid))
+    except Exception:
+        pass
+    text, kb = await admins_view()
+    await safe_edit(c, text, kb)
+    await c.answer("Админ убран")
 
 
 @router.message(Reg.name, F.text, ~F.text.in_(MENU_BUTTONS), ~F.text.startswith("/"))
@@ -794,8 +958,8 @@ async def reg_name(m: Message, state: FSMContext):
 async def reg_group(m: Message, state: FSMContext):
     data = await state.get_data()
     await execute(
-        "INSERT OR REPLACE INTO users (tg_id, full_name, grp) VALUES (?, ?, ?)",
-        m.from_user.id, data["name"], m.text.strip()[:32],
+        "INSERT OR REPLACE INTO users (tg_id, full_name, grp, username) VALUES (?, ?, ?, ?)",
+        m.from_user.id, data["name"], m.text.strip()[:32], m.from_user.username,
     )
     await state.clear()
     await m.answer("Готово ✅ Когда откроется новая очередь — пришлю уведомление.\n"
@@ -1159,7 +1323,8 @@ async def cb_rdel(c: CallbackQuery):
 
 async def set_admin_commands(bot: Bot, uid: int):
     try:
-        await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=uid))
+        await bot.set_my_commands(OWNER_COMMANDS if uid in owners else ADMIN_COMMANDS,
+                                  scope=BotCommandScopeChat(chat_id=uid))
     except Exception as e:  # админ ещё не писал боту или нет связи
         log.warning("Не удалось задать команды админа: %s", e)
 

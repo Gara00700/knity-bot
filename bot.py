@@ -8,6 +8,10 @@
 Очередь двигается сама: первый в очереди после сдачи жмёт «✅ Сдал»,
 и бот зовёт следующего.
 """
+# Версия бота: при каждой правке увеличиваем.
+# 2.1 — версия видна в «Помощи», в /version и в логах при запуске
+BOT_VERSION = "2.1"
+
 import asyncio
 import html
 import json
@@ -92,6 +96,7 @@ STUDENT_COMMANDS = [
     BotCommand(command="schedule", description="Расписание пар"),
     BotCommand(command="profile", description="Изменить имя и группу"),
     BotCommand(command="help", description="Как пользоваться"),
+    BotCommand(command="version", description="Версия бота"),
 ]
 ADMIN_COMMANDS = STUDENT_COMMANDS + [
     BotCommand(command="add", description="Новая повторяющаяся очередь"),
@@ -741,7 +746,14 @@ async def cmd_start(m: Message, state: FSMContext, command: CommandObject):
 @router.message(Command("help"))
 async def cmd_help(m: Message, state: FSMContext):
     await state.clear()
-    await say(m, HELP_TEXT + (ADMIN_HELP if is_admin(m.from_user.id) else ""))
+    await say(m, HELP_TEXT + (ADMIN_HELP if is_admin(m.from_user.id) else "")
+              + f"\n\n<i>Версия бота: {BOT_VERSION}</i>")
+
+
+@router.message(Command("version"))
+async def cmd_version(m: Message, state: FSMContext):
+    await state.clear()
+    await say(m, f"🤖 Версия бота: <b>{BOT_VERSION}</b>")
 
 
 @router.message(Command("my"))
@@ -1592,6 +1604,7 @@ async def set_admin_commands(bot: Bot, uid: int):
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    log.info("Запуск бота, версия %s", BOT_VERSION)
     await init_db()
     session = AiohttpSession(proxy=TG_PROXY) if TG_PROXY else None
     if TG_PROXY:

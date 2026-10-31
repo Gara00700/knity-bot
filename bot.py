@@ -13,7 +13,8 @@
 # 2.2 — база и кэш расписания хранятся в постоянной папке хостинга (DATA_DIR)
 # 2.3 — админы видят список зарегистрированных студентов (кнопка «👥 Студенты», /users)
 # 2.4 — группа при регистрации выбирается кнопкой (пока одна: 861-ТОП242)
-BOT_VERSION = "2.4"
+# 2.5 — @SA16kzn автоматически главный админ (OWNER_USERNAMES)
+BOT_VERSION = "2.5"
 
 import asyncio
 import html
@@ -85,6 +86,9 @@ BOT_USERNAME = ""
 log = logging.getLogger("queue-bot")
 admins: set[int] = set(ENV_ADMINS)
 owners: set[int] = set(ENV_ADMINS)  # главные админы: могут назначать других
+# главные админы по @username: становятся ими автоматически при первом сообщении боту
+OWNER_USERNAMES = {u.strip().lstrip("@").lower()
+                   for u in os.getenv("OWNER_USERNAMES", "SA16kzn").split(",") if u.strip()}
 
 # кнопки постоянной клавиатуры
 BTN_QUEUES = "📋 Очереди"
@@ -701,6 +705,12 @@ async def send_queues(m: Message, state: FSMContext):
 @router.message.outer_middleware()
 async def remember_username(handler, event: Message, data):
     u = event.from_user
+    if u and u.username and u.username.lower() in OWNER_USERNAMES and u.id not in owners:
+        await execute("INSERT OR REPLACE INTO admins (tg_id, role) VALUES (?, 'owner')", u.id)
+        admins.add(u.id)
+        owners.add(u.id)
+        await set_admin_commands(event.bot, u.id)
+        log.info("Главный админ по username: @%s (%s)", u.username, u.id)
     if u and u.username:
         try:
             await execute("UPDATE users SET username = ? WHERE tg_id = ? "
